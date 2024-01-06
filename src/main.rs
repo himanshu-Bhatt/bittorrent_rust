@@ -7,19 +7,17 @@ use std::{env, usize};
 
 #[allow(dead_code)]
 fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
+    //if encoded_value is list
+    if encoded_value.chars().nth(0) == Some('l') {}
     //if encoded value satrt with i its integers
-    if let Some(rest) = encoded_value.strip_prefix('i') {
-        if let Some((digits, _)) = rest.split_once('e') {
-            // print!("holla");
-
-            // return serde_json::Value::Number(digits.into())
-            // println!("{}", type_name::<typeof(digits)>());
-            if let Ok(n) = digits.parse::<i64>() {
-                return n.into();
-            }
-            // return digits.into();
+    if encoded_value.chars().nth(0) == Some('i') {
+        if let Some(n) = encoded_value
+            .strip_prefix('i')
+            .and_then(|rest| rest.split_once('e'))
+            .and_then(|(digits, _)| digits.parse::<i64>().ok())
+        {
+            return n.into();
         }
-        // let string = &encoded_value[1..encoded_value.len() - 1];
     }
     // If encoded_value starts with a digit, it's a number
     else if encoded_value.chars().next().unwrap().is_digit(10) {
