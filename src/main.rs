@@ -1,4 +1,5 @@
 use serde_json;
+// use std::any::type_name;
 use std::{env, usize};
 
 // Available if you need it!
@@ -11,7 +12,12 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
         if let Some((digits, _)) = rest.split_once('e') {
             // print!("holla");
 
-            return serde_json::Value::String(digits.to_string());
+            // return serde_json::Value::Number(digits.into())
+            // println!("{}", type_name::<typeof(digits)>());
+            if let Ok(n) = digits.parse::<i64>() {
+                return n.into();
+            }
+            // return digits.into();
         }
         // let string = &encoded_value[1..encoded_value.len() - 1];
     }
@@ -41,7 +47,7 @@ fn main() {
         // Uncomment this block to pass the first stage
         let encoded_value = &args[2];
         let decoded_value = decode_bencoded_value(encoded_value);
-        println!("{}", decoded_value.to_string());
+        println!("{}", decoded_value);
     } else {
         eprintln!("unknown command: {}", args[1])
     }
