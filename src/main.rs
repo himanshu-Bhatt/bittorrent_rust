@@ -1,21 +1,23 @@
-use anyhow::Context;
-use bittorrent_starter_rust::{Peers, TrackerRequest, TrackerResponse};
-// use serde;
+use anyhow::{Context};
+use bittorrent_starter_rust::{Handshake, Peers, TrackerRequest, TrackerResponse};
 use serde::{Deserialize, Serialize};
 use serde_bencode;
 use serde_json;
-// use std::any::type_name;
-// use hex_literal::hex;
-use hex::{self, FromHex};
+use hex;
 use reqwest;
 use serde_bytes::ByteBuf;
-// use sha2::{Digest, Sha256};
+use bincode;
 use sha1::{Digest, Sha1};
+use std::io::Read;
+use std::net::TcpStream;
 use std::{
     env, fs,
+    io::Write,
     net::{Ipv4Addr, SocketAddrV4},
     usize,
 };
+use tokio_util::codec::Decoder;
+use bytes::{BytesMut, Buf};
 
 #[derive(Debug, Deserialize)]
 struct Torrent {
@@ -24,18 +26,6 @@ struct Torrent {
     info: Info,
 }
 
-// #[derive(Debug, Clone, Deserialize)]
-// struct Info {
-//     // size of the file in bytes, for single-file torrents
-//     length: usize,
-//     // suggested name to save the file / directory as
-//     name: String,
-//     // number of bytes in each piece
-//     #[serde(rename = "piece length")]
-//     piece_length: usize,
-//     // concatenated SHA-1 hashes of each piece
-//     pieces: String,
-// }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Info {
@@ -43,40 +33,15 @@ struct Info {
     pub pieces: ByteBuf,
     #[serde(rename = "piece length")]
     pub piece_length: usize,
-    // #[serde(default)]
-    // pub md5sum: Option<String>,
     #[serde(default)]
     pub length: usize,
-    // #[serde(default)]
-    // pub files: Option<Vec<File>>,
-    // #[serde(default)]
-    // pub private: Option<u8>,
-    // #[serde(default)]
-    // pub path: Option<Vec<String>>,
-    // #[serde(default)]
-    // #[serde(rename = "root hash")]
-    // pub root_hash: Option<String>,
 }
 
 fn read_file_vec(filepath: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let data = fs::read(filepath)?;
-    // eprint!("{}", filepath);
     Ok(data)
 }
 
-// async fn get_peer_list(torrent: &Torrent)-> Result<Vec<String>,Box<dyn std::error::Error>> {
-//     let client = reqwest::Client::new();
-//     let res = client
-//         .post(torrent.announce)
-//         .body("the exact body that is sent")
-//         .send()
-//         .await?;
-
-// }
-
-// fn info_hash(info:&Info)->[u8,20]{
-
-// }
 
 fn get_info_hash(info_encoded: &Vec<u8>) -> [u8; 20] {
     let mut hasher = Sha1::new();
@@ -109,21 +74,17 @@ fn parse_torrent_file(filename: &str) -> (String, usize, [u8; 20], usize, Vec<St
                         })
                         .collect();
 
-                    // get_peer_list(&con);
-
                     return (con.announce, con.info.length, hash, p_length, pieces);
 
-                    // hasher.update(con.info);
                 }
             }
         }
     }
-    // let s = "hello word";
 
     panic!("NOt able to parse torent file");
 }
 
-async fn find_peers(file_name: &str) -> anyhow::Result<()> {
+async fn find_peers(file_name: &str) -> anyhow::Result<Vec<SocketAddrV4>> {
     let (url, length, info_hash, piece_length, pieces) = parse_torrent_file(file_name);
 
     let url_params = TrackerRequest {
@@ -147,7 +108,7 @@ async fn find_peers(file_name: &str) -> anyhow::Result<()> {
         .context("queying the tracker url")?;
     let response = response.bytes().await.context("fetching response")?;
     let response: TrackerResponse =
-        serde_bencode::from_bytes(&response).context("parse tracker response")?; //commenting out coz don't have codecrafter's paid subscription.
+        serde_bencode::from_bytes(&response).context("parse tracker response")?; //hardcoding peeers coz don't have codecrafter's paid subscription.
 
     let mut p_vec = Vec::new();
     p_vec.push(SocketAddrV4::new(Ipv4Addr::new(178, 62, 82, 89), 51470));
@@ -162,7 +123,8 @@ async fn find_peers(file_name: &str) -> anyhow::Result<()> {
     for peer in &response.peers.0 {
         println!("{}:{}", peer.ip(), peer.port());
     }
-    Ok(())
+    return Ok(response.peers.0);
+    // Ok(())
 }
 
 fn urlencode(t: &[u8; 20]) -> String {
@@ -173,7 +135,68 @@ fn urlencode(t: &[u8; 20]) -> String {
     }
     encoded
 }
-// Usage: your_bittorrent.sh decode "<encoded_value>"
+
+struct MessageDecoder {}
+
+const MAX: usize =1<<16;
+
+impl Decoder for MessageDecoder {
+    type Item = String;
+    type Error = std::io::Error;
+
+    fn decode(
+        &mut self,
+        src: &mut BytesMut
+    ) -> Result<Option<Self::Item>, Self::Error> {
+        if src.len() < 4 {
+            // Not enough data to read length marker.
+            return Ok(None);
+        }
+
+        // Read length marker.
+        let mut length_bytes = [0u8; 4];
+        length_bytes.copy_from_slice(&src[..4]);
+        let length = u32::from_le_bytes(length_bytes) as usize;
+
+        // Check that the length is not too large to avoid a denial of
+        // service attack where the server runs out of memory.
+        if length > MAX {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Frame of length {} is too large.", length)
+            ));
+        }
+
+        if src.len() < 4 + length {
+            // The full string has not yet arrived.
+            //
+            // We reserve more space in the buffer. This is not strictly
+            // necessary, but is a good idea performance-wise.
+            src.reserve(4 + length - src.len());
+
+            // We inform the Framed that we need more bytes to form the next
+            // frame.
+            return Ok(None);
+        }
+
+        // Use advance to modify src such that it no longer contains
+        // this frame.
+        let tag=src[5].to_vec();
+        let data = src[4..4 + length].to_vec();
+        src.advance(4 + length);
+
+        // Convert the data to a string, or fail if it is not valid utf-8.
+        match String::from_utf8(data) {
+            Ok(string) => Ok(Some(string)),
+            Err(utf8_error) => {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    utf8_error.utf8_error(),
+                ))
+            },
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -181,10 +204,6 @@ async fn main() -> anyhow::Result<()> {
     let command = &args[1];
 
     if command == "decode" {
-        // You can use print statements as follows for debugging, they'll be visible when running tests.
-        // eprintln!("Logs from your program will appear here!");
-
-        // Uncomment this block to pass the first stage
         let encoded_value = &args[2];
         let decoded_value = decode_bencoded_value(encoded_value).0.to_string();
         println!("{}", decoded_value);
@@ -198,14 +217,31 @@ async fn main() -> anyhow::Result<()> {
         println!("{:?}", pieces);
     } else if command == "peers" {
         let file_name = &args[2];
-        // eprint!("Hellooo from 186");
         let _ = find_peers(file_name).await;
-    }else if command=="handshake"{
-        
+    } else if command == "handshake" {
+        let peer_info = &args[3];
+        let file_name = &args[2];
+        let (_, _, hash, _, _) = parse_torrent_file(file_name);
+
+        let mut stream = TcpStream::connect(peer_info)?;
+        let handshake = Handshake {
+            length: 19,
+            bittorent: *b"BitTorrent protocol",
+            reserved: [0; 8],
+            info_hash: hash,
+            peer_id: *b"00112233445566778899",
+        };
+        let serialized_handshake = bincode::serialize(&handshake)?;
+
+        stream.write_all(&serialized_handshake)?;
+        let mut res: [u8; std::mem::size_of::<Handshake>()] = [0; std::mem::size_of::<Handshake>()];
+        stream.read(&mut res)?;
+        let res = bincode::deserialize::<Handshake>(&res)?;
+        let peer_id = hex::encode(&res.peer_id);
+        println!("Peer ID {:?}", peer_id);
     } else {
         eprintln!("unknown command: {}", args[1])
     }
-    // eprint!("Hellooo");
     Ok(())
 }
 
@@ -259,7 +295,6 @@ fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
                     // eprintln!("{}",&string[..len]);
                     Some((&string[..len], &string[len..]))
                 } else {
-                    // panic!("Unhandled encoded value: {}", encoded_value);
                     None
                 }
             }) {
