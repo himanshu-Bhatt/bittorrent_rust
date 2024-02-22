@@ -1,12 +1,16 @@
-use anyhow::{Context};
-use bittorrent_starter_rust::{Handshake, Peers, TrackerRequest, TrackerResponse};
-use serde::{Deserialize, Serialize};
-use serde_bencode;
-use serde_json;
+use anyhow::Context;
+use bincode;
+use bittorrent_starter_rust::{
+    Handshake, Message, MessageTag, Peers, TrackerRequest, TrackerResponse,
+};
+use bytes::BufMut;
+use bytes::{Buf, BytesMut};
 use hex;
 use reqwest;
+use serde::{Deserialize, Serialize};
+use serde_bencode;
 use serde_bytes::ByteBuf;
-use bincode;
+use serde_json;
 use sha1::{Digest, Sha1};
 use std::io::Read;
 use std::net::TcpStream;
@@ -17,7 +21,7 @@ use std::{
     usize,
 };
 use tokio_util::codec::Decoder;
-use bytes::{BytesMut, Buf};
+use tokio_util::codec::Encoder;
 
 #[derive(Debug, Deserialize)]
 struct Torrent {
@@ -25,7 +29,6 @@ struct Torrent {
     announce: String,
     info: Info,
 }
-
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Info {
@@ -41,7 +44,6 @@ fn read_file_vec(filepath: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> 
     let data = fs::read(filepath)?;
     Ok(data)
 }
-
 
 fn get_info_hash(info_encoded: &Vec<u8>) -> [u8; 20] {
     let mut hasher = Sha1::new();
@@ -75,7 +77,6 @@ fn parse_torrent_file(filename: &str) -> (String, usize, [u8; 20], usize, Vec<St
                         .collect();
 
                     return (con.announce, con.info.length, hash, p_length, pieces);
-
                 }
             }
         }
@@ -136,18 +137,15 @@ fn urlencode(t: &[u8; 20]) -> String {
     encoded
 }
 
-struct MessageDecoder {}
+struct MessageFramer {}
 
-const MAX: usize =1<<16;
+const MAX: usize = 1 << 16;
 
-impl Decoder for MessageDecoder {
-    type Item = String;
+impl Decoder for MessageFramer {
+    type Item = Message;
     type Error = std::io::Error;
 
-    fn decode(
-        &mut self,
-        src: &mut BytesMut
-    ) -> Result<Option<Self::Item>, Self::Error> {
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if src.len() < 4 {
             // Not enough data to read length marker.
             return Ok(None);
@@ -163,7 +161,7 @@ impl Decoder for MessageDecoder {
         if length > MAX {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Frame of length {} is too large.", length)
+                format!("Frame of length {} is too large.", length),
             ));
         }
 
@@ -181,20 +179,49 @@ impl Decoder for MessageDecoder {
 
         // Use advance to modify src such that it no longer contains
         // this frame.
-        let tag=src[5].to_vec();
-        let data = src[4..4 + length].to_vec();
+        let tag = u8::from_be_bytes([src[5]]);
+        let data = src[5..4 + length - 1].to_vec();
         src.advance(4 + length);
+        let tag = match tag {
+            1 => MessageTag::Unchoke,
+            2 => MessageTag::Interested,
+            3 => MessageTag::NotInterested,
+            4 => MessageTag::Have,
+            5 => MessageTag::Bitfield,
+            6 => MessageTag::Request,
+            7 => MessageTag::Piece,
+            8 => MessageTag::Cancel,
+            _ => panic!("Invalid tag value"),
+        };
+        Ok(Some(Message { tag, data }))
+    }
+}
 
-        // Convert the data to a string, or fail if it is not valid utf-8.
-        match String::from_utf8(data) {
-            Ok(string) => Ok(Some(string)),
-            Err(utf8_error) => {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    utf8_error.utf8_error(),
-                ))
-            },
+impl Encoder<Message> for MessageFramer {
+    type Error = std::io::Error;
+
+    fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        // Don't send a string if it is longer than the other end will
+        // accept.
+        if item.data.len() + 1 > MAX {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Frame of length {} is too large.", item.data.len() + 1),
+            ));
         }
+
+        // Convert the length into a byte array.
+        // The cast to u32 cannot overflow due to the length check above.
+        let len_slice = u32::to_be_bytes(item.data.len() as u32 + 1);
+
+        // Reserve space in the buffer.
+        dst.reserve(4 + item.data.len() + 1);
+
+        // Write the length and string to the buffer.
+        dst.extend_from_slice(&len_slice);
+        dst.put_u8(item.tag as u8);
+        dst.extend_from_slice(&item.data[..]);
+        Ok(())
     }
 }
 
@@ -221,6 +248,28 @@ async fn main() -> anyhow::Result<()> {
     } else if command == "handshake" {
         let peer_info = &args[3];
         let file_name = &args[2];
+        let (_, _, hash, _, _) = parse_torrent_file(file_name);
+
+        let mut stream = TcpStream::connect(peer_info)?;
+        let handshake = Handshake {
+            length: 19,
+            bittorent: *b"BitTorrent protocol",
+            reserved: [0; 8],
+            info_hash: hash,
+            peer_id: *b"00112233445566778899",
+        };
+        let serialized_handshake = bincode::serialize(&handshake)?;
+
+        stream.write_all(&serialized_handshake)?;
+        let mut res: [u8; std::mem::size_of::<Handshake>()] = [0; std::mem::size_of::<Handshake>()];
+        stream.read(&mut res)?;
+        let res = bincode::deserialize::<Handshake>(&res)?;
+        let peer_id = hex::encode(&res.peer_id);
+        println!("Peer ID {:?}", peer_id);
+    } else if command == "download_piece" {
+        let peer_info = &args[3];
+        let file_name = &args[4];
+
         let (_, _, hash, _, _) = parse_torrent_file(file_name);
 
         let mut stream = TcpStream::connect(peer_info)?;
