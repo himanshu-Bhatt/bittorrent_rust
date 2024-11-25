@@ -12,4 +12,4 @@ This project is a BitTorrent implementation in Rust, focusing on the following k
 3. **Peer Handshake and Content Downloading:**
    - Establish a handshake with peers according to the BitTorrent protocol.
    - Implement the logic for downloading content from multiple peers concurrently.
-   - Manage the do
+
